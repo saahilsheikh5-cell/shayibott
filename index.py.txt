@@ -11,7 +11,7 @@ from telebot import types
 
 # === CONFIG ===
 BOT_TOKEN = "7638935379:AAEmLD7JHLZ36Ywh5tvmlP1F8xzrcNrym_Q"
-WEBHOOK_URL = "https://shayibott.onrender.com/" + BOT_TOKEN
+WEBHOOK_URL = "https://shayibott-1.onrender.com/" + BOT_TOKEN
 CHAT_ID = 1263295916
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 ALL_COINS_URL = "https://api.binance.com/api/v3/ticker/24hr"
@@ -202,3 +202,4 @@ if __name__=="__main__":
     bot.remove_webhook()
     bot.set_webhook(url=WEBHOOK_URL)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
+
