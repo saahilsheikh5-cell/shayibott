@@ -1,0 +1,204 @@
+import os
+import json
+import telebot
+import requests
+import pandas as pd
+import numpy as np
+import time
+import threading
+from flask import Flask, request
+from telebot import types
+
+# === CONFIG ===
+BOT_TOKEN = "7638935379:AAEmLD7JHLZ36Ywh5tvmlP1F8xzrcNrym_Q"
+WEBHOOK_URL = "https://shayibott.onrender.com/" + BOT_TOKEN
+CHAT_ID = 1263295916
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+ALL_COINS_URL = "https://api.binance.com/api/v3/ticker/24hr"
+
+bot = telebot.TeleBot(BOT_TOKEN)
+app = Flask(__name__)
+
+# === STORAGE ===
+COINS_FILE = "coins.json"
+auto_signal_thread = None
+lock = threading.Lock()
+signal_settings = {
+    "rsi_strong_buy": 20,
+    "rsi_strong_sell": 80,
+    "signal_validity": 300,  # seconds
+    "ultra_filter": True,
+    "max_signals_per_scan": 5
+}
+
+# === HELPER FUNCTIONS ===
+def load_coins():
+    if not os.path.exists(COINS_FILE):
+        with open(COINS_FILE, "w") as f:
+            json.dump([], f)
+    with open(COINS_FILE, "r") as f:
+        return json.load(f)
+
+def save_coins(coins):
+    with open(COINS_FILE, "w") as f:
+        json.dump(coins, f)
+
+def get_coin_name(symbol):
+    for quote in ["USDT","BTC","BNB","ETH","EUR","BRL","GBP"]:
+        if symbol.endswith(quote):
+            return symbol.replace(quote,"")
+    return symbol
+
+def get_klines(symbol, interval="1m", limit=100):
+    try:
+        url = f"{BINANCE_URL}?symbol={symbol}&interval={interval}&limit={limit}"
+        data = requests.get(url, timeout=10).json()
+        df = pd.DataFrame(data, columns=[
+            "time", "o", "h", "l", "c", "v",
+            "ct", "qv", "tn", "tb", "qtb", "ignore"
+        ])
+        df["c"] = df["c"].astype(float)
+        return df
+    except:
+        return None
+
+def get_sma(series, period=20):
+    return series.rolling(period).mean()
+
+def get_ema(series, period=20):
+    return series.ewm(span=period, adjust=False).mean()
+
+def get_rsi(series, period=14):
+    delta = series.diff()
+    gain = np.where(delta>0, delta,0)
+    loss = np.where(delta<0, -delta,0)
+    avg_gain = pd.Series(gain).rolling(period).mean()
+    avg_loss = pd.Series(loss).rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+# === ANALYSIS FUNCTIONS ===
+def analyze_coin(symbol, interval="1m", strong_only=False):
+    df = get_klines(symbol, interval, 100)
+    if df is None or df.empty:
+        return None
+    close = df["c"]
+    price = close.iloc[-1]
+    rsi = get_rsi(close).iloc[-1]
+
+    if strong_only:
+        if rsi < signal_settings["rsi_strong_buy"]:
+            signal = "Strong Buy"
+            emoji = "🔺🟢"
+        elif rsi > signal_settings["rsi_strong_sell"]:
+            signal = "Strong Sell"
+            emoji = "🔻🔴"
+        else:
+            return None
+    else:
+        if rsi < 30:
+            signal = "Buy"
+            emoji = "🟢"
+        elif rsi > 70:
+            signal = "Sell"
+            emoji = "🔴"
+        else:
+            signal = "Neutral"
+            emoji = "⚪"
+
+    sl = round(price * (0.97 if "Buy" in signal else 1.03), 5)
+    tp = round(price * (1.03 if "Buy" in signal else 0.97), 5)
+    validity = f"{int(signal_settings['signal_validity']/60)}m"
+
+    return {
+        "symbol": get_coin_name(symbol),
+        "price": round(price,5),
+        "signal": signal,
+        "emoji": emoji,
+        "stop_loss": sl,
+        "take_profit": tp,
+        "validity": validity
+    }
+
+def get_all_coins():
+    data = requests.get(ALL_COINS_URL, timeout=10).json()
+    return [d["symbol"] for d in data]
+
+# === AUTO SIGNALS ===
+def run_auto_signals():
+    last_signals = {}
+    while True:
+        coins = get_all_coins()
+        signals_sent = 0
+        for sym in coins:
+            result = analyze_coin(sym, strong_only=True)
+            if result:
+                key = f"{result['symbol']}_{result['signal']}"
+                if key not in last_signals:
+                    text = f"🪙 {result['symbol']} | ${result['price']}\n{result['emoji']} {result['signal']}\nStop Loss: ${result['stop_loss']} | Take Profit: ${result['take_profit']}\nValid for: {result['validity']}"
+                    bot.send_message(CHAT_ID, text)
+                    last_signals[key] = time.time()
+                    signals_sent += 1
+                    if signals_sent >= signal_settings["max_signals_per_scan"]:
+                        break
+        # Clean old signals
+        now = time.time()
+        last_signals = {k:v for k,v in last_signals.items() if now - v < signal_settings["signal_validity"]}
+        time.sleep(60)
+
+# === COMMAND HANDLERS ===
+@bot.message_handler(commands=["start"])
+def start(msg):
+    bot.send_message(msg.chat.id,"Welcome to SaahilCryptoBot 🚀\nUse /signals to see ultra-filtered signals.", reply_markup=None)
+
+@bot.message_handler(commands=["signals"])
+def show_signals(msg):
+    coins = get_all_coins()
+    displayed = 0
+    for sym in coins:
+        result = analyze_coin(sym, strong_only=True)
+        if result:
+            text = f"🪙 {result['symbol']} | ${result['price']}\n{result['emoji']} {result['signal']}\nStop Loss: ${result['stop_loss']} | Take Profit: ${result['take_profit']}\nValid for: {result['validity']}"
+            bot.send_message(msg.chat.id, text)
+            displayed += 1
+            if displayed >= signal_settings["max_signals_per_scan"]:
+                break
+
+@bot.message_handler(commands=["analyse"])
+def analyse_any_coin(msg):
+    parts = msg.text.split()
+    if len(parts)!=2:
+        bot.send_message(msg.chat.id,"Usage: /analyse SYMBOL (e.g., /analyse BTCUSDT)")
+        return
+    sym = parts[1].upper()
+    res = analyze_coin(sym)
+    if res:
+        text = f"🪙 {res['symbol']} | ${res['price']}\n{res['emoji']} {res['signal']}\nStop Loss: ${res['stop_loss']} | Take Profit: ${res['take_profit']}\nValid for: {res['validity']}"
+        bot.send_message(msg.chat.id,text)
+    else:
+        bot.send_message(msg.chat.id,f"Could not fetch data for {sym}")
+
+# === START AUTO SIGNAL THREAD ===
+def start_auto_signal_thread():
+    global auto_signal_thread
+    if auto_signal_thread is None or not auto_signal_thread.is_alive():
+        auto_signal_thread = threading.Thread(target=run_auto_signals, daemon=True)
+        auto_signal_thread.start()
+
+# === WEBHOOK ===
+app = Flask(__name__)
+@app.route("/" + BOT_TOKEN, methods=["POST"])
+def webhook():
+    bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
+    return "!",200
+
+@app.route("/")
+def index():
+    return "Bot running!"
+
+# === RUN ===
+if __name__=="__main__":
+    start_auto_signal_thread()
+    bot.remove_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
